@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QTabWidget, QLabel, QDialog, QFormLayout,
     QLineEdit, QSpinBox, QCheckBox, QMessageBox, QDialogButtonBox,
     QToolBar, QAction, QPlainTextEdit, QMenu, QStatusBar, QInputDialog,
-    QSizePolicy, QScrollArea, QFrame
+    QSizePolicy, QScrollArea, QFrame, QTextEdit
 )
 
 
@@ -30,7 +30,7 @@ def get_app_dir() -> Path:
 
 
 CONFIG_FILE = get_app_dir() / "consoles.json"
-APP_TITLE   = "Console Manager - Daemon Runner"
+APP_TITLE   = "Console Daemon Manager"
 
 
 # ============================================================
@@ -86,6 +86,12 @@ def build_preview_url(cfg: dict) -> str:
 
     if params:
         url += "?" + "&".join(params)
+
+    # Indikator headers — hanya kalau use_headers=True DAN headers ada isinya
+    if cfg.get("use_headers"):
+        hdrs = cfg.get("headers")
+        if isinstance(hdrs, dict) and hdrs:
+            url += f"  🔒 [{len(hdrs)} header(s)]"
 
     return url
 
@@ -196,6 +202,46 @@ class DaemonEngine:
                         params[pair.strip()] = ""
         return params
 
+    def _build_headers(self) -> dict:
+        """
+        Parse config['headers'] (JSON string atau dict) menjadi dict HTTP header.
+        HANYA dianggap kalau config['use_headers'] = True.
+
+        Return dict kosong kalau:
+        - use_headers = False / tidak ada
+        - headers kosong / None
+        - JSON tidak valid
+        """
+        # Cek flag use_headers
+        if not self.cfg.get("use_headers"):
+            return {}
+
+        raw = self.cfg.get("headers")
+        if not raw:
+            return {}
+
+        # Kalau sudah dict, pakai langsung
+        if isinstance(raw, dict):
+            return {str(k): str(v) for k, v in raw.items()}
+
+        # Kalau string, coba parse sebagai JSON
+        if isinstance(raw, str):
+            s = raw.strip()
+            if not s:
+                return {}
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, dict):
+                    return {str(k): str(v) for k, v in parsed.items()}
+                else:
+                    self._log_error(
+                        "Headers JSON harus berupa object, contoh: "
+                        '{"Authorization": "Bearer xxx"}'
+                    )
+            except json.JSONDecodeError as e:
+                self._log_error(f"Headers JSON tidak valid: {e}")
+        return {}
+
     def _build_query(self, page=None) -> dict:
         params = {}
         start, end = self._get_date_range()
@@ -249,50 +295,158 @@ class DaemonEngine:
             return None
 
         timeout = self.cfg.get("request_timeout") or 3600
+        headers = self._build_headers()
 
         is_empty = False
         total_data = None
 
         try:
             with requests.get(
-                url, params=params, stream=True, timeout=timeout
+                url,
+                params=params,
+                headers=headers,
+                stream=True,
+                timeout=timeout
             ) as r:
-                r.raise_for_status()
 
-                # Update URL real-time (URL asli yang sedang di-hit)
+                # ------------------------------------------------
+                # Update URL real-time
+                # ------------------------------------------------
                 if self.url_cb:
                     try:
                         self.url_cb(r.url)
                     except Exception:
                         pass
 
-                for line in r.iter_lines(decode_unicode=True):
+                # ------------------------------------------------
+                # HTTP ERROR
+                #
+                # Jangan langsung menggunakan raise_for_status()
+                # karena body JSON dari server harus dibaca dulu.
+                #
+                # Contoh response PHP:
+                #
+                # {
+                #     "status": "error",
+                #     "code": "INVALID_KEY",
+                #     "message": "Invalid url_key"
+                # }
+                # ------------------------------------------------
+                if r.status_code >= 400:
+
+                    self._log_error(
+                        f"HTTP {r.status_code} "
+                        f"{r.reason or 'HTTP Error'}"
+                    )
+
+                    # Ambil body response dari server
+                    try:
+                        response_text = r.text
+                    except Exception as e:
+                        response_text = (
+                            f"(Gagal membaca response body: {e})"
+                        )
+
+                    # Coba parse sebagai JSON
+                    try:
+                        error_json = r.json()
+
+                        pretty_json = json.dumps(
+                            error_json,
+                            indent=2,
+                            ensure_ascii=False
+                        )
+
+                        self._log_error(
+                            "Response server:\n" + pretty_json
+                        )
+
+                    except (ValueError, TypeError):
+
+                        # Jika bukan JSON, tampilkan response mentah
+                        if response_text:
+                            self._log_error(
+                                "Response server:\n" + response_text
+                            )
+                        else:
+                            self._log_error(
+                                "Response server kosong."
+                            )
+
+                    return None
+
+                # ------------------------------------------------
+                # HTTP SUCCESS
+                # ------------------------------------------------
+                for line in r.iter_lines(
+                    decode_unicode=True
+                ):
                     if self.stop_event.is_set():
                         return None
 
                     if line is None:
                         continue
 
-                    self.log(line + "\n", "#d4d4d4")
+                    if not isinstance(line, str):
+                        try:
+                            line = line.decode(
+                                "utf-8",
+                                errors="replace"
+                            )
+                        except Exception:
+                            line = str(line)
+
+                    self.log(
+                        line + "\n",
+                        "#d4d4d4"
+                    )
 
                     low = line.lower()
-                    if ("tidak ada data di page ini" in low
-                            or "tidak ada data eligible" in low
-                            or "tidak ada staff untuk designation ini" in low
-                            or "tidak ada encounter di range tanggal ini" in low
-                            or "tidak ada data patient untuk diproses" in low):
+
+                    if (
+                        "tidak ada data di page ini" in low
+                        or "tidak ada data eligible" in low
+                        or "tidak ada staff untuk designation ini" in low
+                        or "tidak ada encounter di range tanggal ini" in low
+                        or "tidak ada data patient untuk diproses" in low
+                    ):
                         is_empty = True
 
                     if "Total data" in line and ":" in line:
                         try:
-                            total_data = int(line.split(":")[1].strip())
+                            total_data = int(
+                                line.split(":")[1].strip()
+                            )
                         except (ValueError, IndexError):
                             pass
 
-            return {"is_empty": is_empty, "total_data": total_data}
+                return {
+                    "is_empty": is_empty,
+                    "total_data": total_data
+                }
+
+        except requests.exceptions.Timeout as e:
+            self._log_error(
+                f"TIMEOUT page {page}: {e}"
+            )
+            return None
+
+        except requests.exceptions.ConnectionError as e:
+            self._log_error(
+                f"CONNECTION ERROR page {page}: {e}"
+            )
+            return None
 
         except requests.exceptions.RequestException as e:
-            self._log_error(f"ERROR page {page}: {e}")
+            self._log_error(
+                f"REQUEST ERROR page {page}: {e}"
+            )
+            return None
+
+        except Exception as e:
+            self._log_error(
+                f"ERROR page {page}: {e}"
+            )
             return None
 
     # -------------------- Main loop --------------------
@@ -415,7 +569,8 @@ class ConsoleConfigDialog(QDialog):
     def __init__(self, parent=None, initial: dict | None = None):
         super().__init__(parent)
         self.setWindowTitle("Konfigurasi Console")
-        self.setMinimumWidth(620)
+        self.setMinimumWidth(640)
+        self.setMinimumHeight(700)
 
         self.result_config = None
         self._initial = initial or {}
@@ -485,6 +640,61 @@ class ConsoleConfigDialog(QDialog):
         lbl_hint.setWordWrap(True)
         lbl_hint.setStyleSheet("color: #666; font-size: 10px;")
         layout.addWidget(lbl_hint)
+
+        # ---------- HEADERS ----------
+        lbl_headers = QLabel("── HTTP Headers (opsional, format JSON) ──")
+        lbl_headers.setStyleSheet(
+            "color: #888; font-size: 11px; padding-top: 8px;"
+        )
+        layout.addWidget(lbl_headers)
+
+        # Checkbox: apakah headers ini dikirim atau tidak
+        self.chk_use_headers = QCheckBox(
+            "Kirim HTTP Headers ini (kalau tidak dicentang, header diabaikan)"
+        )
+        self.chk_use_headers.setToolTip(
+            "Centang untuk mengirim header di bawah ini.\n"
+            "Kalau tidak dicentang, header akan diabaikan meskipun ada isinya."
+        )
+        self.chk_use_headers.setChecked(
+            bool(self._initial.get("use_headers", False))
+        )
+        layout.addWidget(self.chk_use_headers)
+
+        self.inp_headers = QTextEdit()
+        self.inp_headers.setPlaceholderText(
+            '{\n'
+            '  "url_key": "123456",\n'
+            '  "Authorization": "Bearer YOUR_TOKEN_HERE",\n'
+            '  "X-API-Key": "your-api-key"\n'
+            '}'
+        )
+        self.inp_headers.setMinimumHeight(100)
+        self.inp_headers.setMaximumHeight(160)
+
+        # Pre-fill dari config
+        initial_headers = self._initial.get("headers")
+        if initial_headers:
+            if isinstance(initial_headers, dict):
+                try:
+                    self.inp_headers.setPlainText(
+                        json.dumps(initial_headers, indent=2, ensure_ascii=False)
+                    )
+                except Exception:
+                    pass
+            elif isinstance(initial_headers, str):
+                self.inp_headers.setPlainText(initial_headers)
+
+        layout.addWidget(self.inp_headers)
+
+        lbl_hint_headers = QLabel(
+            "💡 Isi dengan format JSON object. Contoh: "
+            '{"url_key": "123456", "Authorization": "Bearer xxx"}. '
+            "Headers hanya dikirim kalau checkbox di atas dicentang."
+        )
+        lbl_hint_headers.setWordWrap(True)
+        lbl_hint_headers.setStyleSheet("color: #666; font-size: 10px;")
+        layout.addWidget(lbl_hint_headers)
 
         # ---------- TOGGLE PARAMETER ----------
         lbl_toggle = QLabel("── Parameter yang dikirim ke URL ──")
@@ -576,7 +786,7 @@ class ConsoleConfigDialog(QDialog):
         self.setStyleSheet("""
             QDialog { background: #2d2d30; }
             QLabel { color: #ddd; }
-            QLineEdit, QSpinBox {
+            QLineEdit, QSpinBox, QTextEdit {
                 background: #1e1e1e;
                 color: #ddd;
                 border: 1px solid #3f3f46;
@@ -584,7 +794,13 @@ class ConsoleConfigDialog(QDialog):
                 padding: 6px;
                 selection-background-color: #264f78;
             }
-            QLineEdit:focus, QSpinBox:focus { border: 1px solid #007acc; }
+            QLineEdit:focus, QSpinBox:focus, QTextEdit:focus {
+                border: 1px solid #007acc;
+            }
+            QTextEdit {
+                font-family: 'Consolas', 'Courier New', monospace;
+                font-size: 12px;
+            }
             QCheckBox { color: #ddd; spacing: 8px; }
             QCheckBox::indicator {
                 width: 16px; height: 16px;
@@ -642,6 +858,41 @@ class ConsoleConfigDialog(QDialog):
         if extra_query == "":
             extra_query = None
 
+        # ---- Parse headers (JSON) ----
+        # Headers tetap disimpan meskipun checkbox tidak dicentang,
+        # supaya user bisa siapkan headers dulu tanpa harus aktifkan.
+        headers_raw = self.inp_headers.toPlainText().strip()
+        headers = None
+        if headers_raw:
+            try:
+                parsed = json.loads(headers_raw)
+                if not isinstance(parsed, dict):
+                    raise ValueError(
+                        'Headers harus berupa object JSON, contoh: '
+                        '{"url_key": "123456"}'
+                    )
+                headers = {str(k): str(v) for k, v in parsed.items()}
+            except json.JSONDecodeError as e:
+                QMessageBox.warning(
+                    self, "Validasi Headers",
+                    f"Format JSON tidak valid:\n{e}"
+                )
+                return
+            except ValueError as e:
+                QMessageBox.warning(self, "Validasi Headers", str(e))
+                return
+
+        use_headers = self.chk_use_headers.isChecked()
+
+        # Kalau user centang use_headers tapi isi kosong, kasih warning
+        if use_headers and not headers:
+            QMessageBox.warning(
+                self, "Validasi Headers",
+                "Anda mencentang 'Kirim HTTP Headers' tapi isi Headers kosong.\n"
+                "Isi headers-nya dulu, atau hilangkan centangnya."
+            )
+            return
+
         base_url = base_url.rstrip("/")
 
         cfg = {
@@ -650,6 +901,8 @@ class ConsoleConfigDialog(QDialog):
             "endpoint": endpoint,
             "path_params": path_params,
             "extra_query": extra_query,
+            "headers": headers,
+            "use_headers": use_headers,
             "use_range": self.chk_use_range.isChecked(),
             "range_days": self.inp_range_days.value()
                           if self.chk_use_range.isChecked() else None,
@@ -964,6 +1217,14 @@ class ConsoleWidget(QWidget):
         if extra_bits:
             info_parts.append(" ".join(extra_bits))
 
+        # Indikator headers — hanya kalau use_headers=True
+        if self.cfg.get("use_headers"):
+            hdrs = self.cfg.get("headers")
+            if isinstance(hdrs, dict) and hdrs:
+                info_parts.append(f"🔒 {len(hdrs)} header(s)")
+            else:
+                info_parts.append("🔒 headers (kosong)")
+
         self.lbl_meta = QLabel(" | ".join(info_parts))
         self.lbl_meta.setStyleSheet("color: #888; font-size: 11px;")
         self.lbl_meta.setWordWrap(False)
@@ -1168,6 +1429,14 @@ class ConsoleWidget(QWidget):
         if extra_bits:
             info_parts.append(" ".join(extra_bits))
 
+        # Indikator headers — hanya kalau use_headers=True
+        if self.cfg.get("use_headers"):
+            hdrs = self.cfg.get("headers")
+            if isinstance(hdrs, dict) and hdrs:
+                info_parts.append(f"🔒 {len(hdrs)} header(s)")
+            else:
+                info_parts.append("🔒 headers (kosong)")
+
         self.lbl_meta.setText(" | ".join(info_parts))
         self._update_url_label()
 
@@ -1324,6 +1593,14 @@ class MainWindow(QMainWindow):
                 c.setdefault("endpoint", "")
                 c.setdefault("path_params", None)
                 c.setdefault("extra_query", None)
+                c.setdefault("headers", None)
+                # Migrasi: kalau ada headers tapi belum ada use_headers,
+                # otomatis set use_headers=True (biar backward compatible)
+                if "use_headers" not in c:
+                    if c.get("headers"):
+                        c["use_headers"] = True
+                    else:
+                        c["use_headers"] = False
                 c.setdefault("use_range", True)
                 c.setdefault("range_days", 30)
                 c.setdefault("use_per_page", True)
@@ -1362,19 +1639,13 @@ class MainWindow(QMainWindow):
     def _rebuild_tabs(self):
         """
         Smart rebuild: hanya ubah apa yang perlu diubah.
-
-        - Widget yang console-nya masih enabled → pertahankan
-          (running tetap running, output utuh)
-        - Widget yang console-nya baru disabled → shutdown & hapus
-        - Console baru yang enabled → buat widget baru
-        - Urutan tab disesuaikan dengan urutan self.consoles
         """
         enabled_names = [
             c["name"] for c in self.consoles if c.get("enabled", True)
         ]
         enabled_set = set(enabled_names)
 
-        # 1) Hapus widget yang sudah tidak enabled (di-disable / dihapus)
+        # 1) Hapus widget yang sudah tidak enabled
         for name in list(self.widgets.keys()):
             if name not in enabled_set:
                 w = self.widgets.pop(name)
@@ -1395,7 +1666,6 @@ class MainWindow(QMainWindow):
                 continue
             name = c["name"]
             if name not in self.widgets:
-                # Widget baru
                 w = ConsoleWidget(c)
                 w.state_changed.connect(lambda n, s: self._update_status())
                 self.widgets[name] = w
@@ -1403,15 +1673,12 @@ class MainWindow(QMainWindow):
                 self.tabs.addTab(w, name)
                 self.tabs.blockSignals(False)
             else:
-                # Widget sudah ada — sinkron cfg hanya kalau objeknya beda
                 existing = self.widgets[name]
                 if existing.cfg is not c:
-                    # Kalau widget sedang running, worker masih pakai cfg lama.
-                    # Sync ini hanya untuk metadata & siklus berikutnya.
                     existing.cfg = c
                     existing.refresh_meta()
 
-        # 3) Urutkan ulang tab sesuai urutan enabled_names
+        # 3) Urutkan ulang tab
         self.tabs.blockSignals(True)
         for target_idx, name in enumerate(enabled_names):
             w = self.widgets.get(name)
@@ -1427,7 +1694,6 @@ class MainWindow(QMainWindow):
         self._update_status()
 
     def _find_tab_index(self, widget) -> int:
-        """Cari index tab dari widget."""
         for i in range(self.tabs.count()):
             if self.tabs.widget(i) is widget:
                 return i
@@ -1444,14 +1710,10 @@ class MainWindow(QMainWindow):
         return w
 
     def _close_tab(self, index: int):
-        """
-        Close tab = nonaktifkan (enabled=False), bukan hapus dari config.
-        """
         w = self.tabs.widget(index)
         if not isinstance(w, ConsoleWidget):
             return
 
-        # Kalau running, tanya dulu
         if w.is_running:
             reply = QMessageBox.question(
                 self, "Tutup Tab",
@@ -1463,13 +1725,11 @@ class MainWindow(QMainWindow):
                 return
             w.shutdown()
 
-        # Set enabled=False di config
         for c in self.consoles:
             if c["name"] == w.name:
                 c["enabled"] = False
                 break
 
-        # Hapus tab & widget dari memori
         self.tabs.blockSignals(True)
         self.tabs.removeTab(index)
         self.tabs.blockSignals(False)
@@ -1636,7 +1896,6 @@ class MainWindow(QMainWindow):
 
         self.consoles.append(cfg)
         self._save_config()
-        # Pakai smart rebuild supaya konsisten & tidak reset widget lain
         self._rebuild_tabs()
         self._update_status()
 
@@ -1688,7 +1947,6 @@ class MainWindow(QMainWindow):
 def main():
     signal.signal(signal.SIGINT, signal.SIG_DFL)
 
-    # Fusion style biar dialog-dialog konsisten (rename, messagebox, dll.)
     QApplication.setStyle("Fusion")
 
     app = QApplication(sys.argv)
